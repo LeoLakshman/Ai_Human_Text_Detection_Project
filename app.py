@@ -59,23 +59,35 @@ def load_keras_models():
     """Load Keras .h5 models (FNN/LSTM/CNN). These were trained in Google Colab
     (see notebooks/project1_notebook.ipynb, Section 3.4-3.6) and are too large
     (~30MB each) to commit directly to the repo, so they're hosted as GitHub
-    Release assets and downloaded here on first run, then cached in models/."""
+    Release assets and downloaded here on first run, then cached in models/.
+
+    This function is defensive on purpose: if anything in the download/import
+    chain fails (missing package, network issue, missing asset), we log a
+    warning in the sidebar and simply return fewer available models instead
+    of crashing the whole app.
+    """
     loaded = {}
     try:
         from tensorflow.keras.models import load_model
     except ImportError:
-        return loaded  # TensorFlow not installed in this environment
+        return loaded  # TensorFlow not installed — skip Keras models entirely
 
-    from utils.remote_models import ensure_assets
-    asset_names = ["fnn_model.h5", "lstm_model.h5", "cnn_model.h5"]
-    download_status = ensure_assets(asset_names, _st=st)
+    download_status = {}
+    try:
+        from utils.remote_models import ensure_assets
+        asset_names = ["fnn_model.h5", "lstm_model.h5", "cnn_model.h5"]
+        download_status = ensure_assets(asset_names, _st=st)
+    except Exception as e:
+        st.sidebar.warning(f"Couldn't download models from GitHub Release ({e}). "
+                             f"Falling back to whatever already exists in models/.")
 
     for name, fname in [("FNN (Keras)", "fnn_model.h5"),
                          ("LSTM", "lstm_model.h5"),
                          ("CNN", "cnn_model.h5")]:
-        if not download_status.get(fname):
-            continue  # not available locally or in the release — skip silently, listed in sidebar below
         path = os.path.join(MODELS_DIR, fname)
+        have_it = download_status.get(fname, False) or os.path.exists(path)
+        if not have_it:
+            continue  # not available locally or in the release — skip silently
         try:
             loaded[name] = load_model(path)
         except Exception as e:
@@ -86,9 +98,14 @@ def load_keras_models():
 @st.cache_resource
 def load_embedding_assets():
     """Load Word2Vec model + Keras tokenizer for the deep-learning models.
-    Also hosted on the GitHub Release alongside the .h5 files (see load_keras_models)."""
-    from utils.remote_models import ensure_assets
-    ensure_assets(["word2vec.model", "tokenizer.json"], _st=st)
+    Also hosted on the GitHub Release alongside the .h5 files (see load_keras_models).
+    Defensive for the same reason: a missing package/asset should disable the
+    affected models, not crash the app."""
+    try:
+        from utils.remote_models import ensure_assets
+        ensure_assets(["word2vec.model", "tokenizer.json"], _st=st)
+    except Exception as e:
+        st.sidebar.warning(f"Couldn't download embedding assets ({e}).")
 
     w2v, tokenizer = None, None
     w2v_path = os.path.join(MODELS_DIR, "embedding_model", "word2vec.model")
@@ -97,15 +114,15 @@ def load_embedding_assets():
         try:
             from gensim.models import Word2Vec
             w2v = Word2Vec.load(w2v_path)
-        except ImportError:
-            pass
+        except Exception as e:
+            st.sidebar.warning(f"Could not load Word2Vec: {e}")
     if os.path.exists(tok_path):
         try:
             from tensorflow.keras.preprocessing.text import tokenizer_from_json
             with open(tok_path) as f:
                 tokenizer = tokenizer_from_json(f.read())
-        except ImportError:
-            pass
+        except Exception as e:
+            st.sidebar.warning(f"Could not load tokenizer: {e}")
     return w2v, tokenizer
 
 
