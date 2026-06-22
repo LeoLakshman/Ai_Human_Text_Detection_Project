@@ -69,7 +69,6 @@ def load_keras_models():
         path = os.path.join(MODELS_DIR, fname)
         if os.path.exists(path):
             try:
-                # compile=False avoids errors due to custom learning rates during inference loading
                 loaded[name] = load_model(path, compile=False)
             except Exception as e:
                 st.sidebar.warning(f"Could not load {name}: {e}")
@@ -80,10 +79,9 @@ def load_keras_models():
 def load_embedding_assets():
     """Load the Keras text tokenizer sequence asset for deep-learning models."""
     tokenizer = None
-    # Check for tokenizer json inside the embedding directory or directly in models/
     tok_candidates = [
-        os.path.join(MODELS_DIR, "embedding_model", "tokenizer.json"),
-        os.path.join(MODELS_DIR, "tokenizer.json")
+        os.path.join(MODELS_DIR, "tokenizer.json"),
+        os.path.join(MODELS_DIR, "embedding_model", "tokenizer.json")
     ]
     
     for path in tok_candidates:
@@ -93,7 +91,7 @@ def load_embedding_assets():
                 with open(path, 'r', encoding='utf-8') as f:
                     tokenizer = tokenizer_from_json(f.read())
                 break
-            except ImportError:
+            except Exception:
                 pass
     return tokenizer
 
@@ -135,7 +133,7 @@ def build_classical_features(text, tfidf, ling_scaler):
 
 
 def predict_with_model(name, text, models, tfidf, ling_scaler, tokenizer):
-    """Returns (label_str, confidence_float_0to1)."""
+    """Returns (pred_label, confidence_float)."""
     clean = simple_clean_text(text)
 
     # Traditional ML Model routing logic
@@ -154,15 +152,13 @@ def predict_with_model(name, text, models, tfidf, ling_scaler, tokenizer):
         model = models["keras"][name]
         
         if tokenizer is None:
-            raise RuntimeError("Sequence tokenizer asset not found in models/ folder.")
+            raise RuntimeError("Sequence tokenizer asset 'tokenizer.json' not found in models/ folder. Please run your Colab notebook export block and upload it.")
             
         from tensorflow.keras.preprocessing.sequence import pad_sequences
         
-        # Convert raw text string into token-index integer sequences
         seq = tokenizer.texts_to_sequences([clean])
         padded = pad_sequences(seq, maxlen=250, padding="post", truncating="post")
         
-        # Run inference matrix calculation
         proba = float(model.predict(padded, verbose=0).ravel()[0])
         pred = int(proba >= 0.5)
         return pred, proba
@@ -176,7 +172,6 @@ def explain_prediction(text, sklearn_models, tfidf, top_n=12):
         return None
     svm = sklearn_models["SVM"]
     try:
-        # Check if the SVM model object is wrapped inside CalibratedClassifierCV or is a raw LinearSVC
         if hasattr(svm, "calibrated_classifiers_"):
             coefs = np.mean([cc.estimator.coef_[0] for cc in svm.calibrated_classifiers_], axis=0)
         else:
@@ -243,6 +238,9 @@ with st.sidebar:
     missing_dl = [n for n in ["FNN (Keras)", "LSTM", "CNN"] if n not in keras_models]
     if missing_dl:
         st.caption(f"Deep learning models currently inactive: {', '.join(missing_dl)}")
+        
+    if tokenizer is None and any(m in available_model_names for m in ["FNN (Keras)", "LSTM", "CNN"]):
+        st.sidebar.error("⚠️ 'tokenizer.json' is missing from 'models/'. Deep Learning models will fail until it is uploaded.")
 
     run_btn = st.button("🔍 Run Prediction Framework", type="primary", use_container_width=True)
 
@@ -252,6 +250,9 @@ if run_btn and text_input.strip():
     word_count = len(text_input.split())
     if word_count < 20:
         st.warning("This sequence string length is short — accuracy readings stabilize on sequences above 50+ words.")
+
+    # Extract styling signals uniformly upfront to ensure metrics are always populated
+    ling_feats = extract_linguistic_features(simple_clean_text(text_input))
 
     # ---- Single-model prediction ----
     with tab_predict:
@@ -267,10 +268,9 @@ if run_btn and text_input.strip():
             c1, c2 = st.columns([1, 1])
             with c1:
                 st.metric("Classifier Result Matrix", label)
-                st.metric("Model Confidence Evaluation", f"{confidence*100:.2f}%")
+                st.metric("Model Confidence Evaluation", f"{confidence*100:.1f}%")
                 st.progress(float(confidence))
             with c2:
-                ling_feats = extract_linguistic_features(simple_clean_text(text_input))
                 st.write("**Extracted Document Linguistic Signal Values**")
                 st.write(f"- Absolute Token Word Count: {word_count}")
                 st.write(f"- Mean Sentence Evaluation Span: {ling_feats['avg_sentence_length']:.2f} words")
@@ -324,8 +324,8 @@ if run_btn and text_input.strip():
             f"Input Analysis Evaluation Token Metric Count: {word_count}",
             "",
             f"Active Evaluation Model Selection ID: {model_choice}",
-            f"Calculated Inference Class Categorization: {'AI-Generated' if pred == 1 else 'Human-Written' if pred == 0 else 'Error State'}",
-            f"Computed Confidence Reading Boundary Level: {confidence*100:.2f}%" if pred is not None else "",
+            f"Calculated Inference Class Categorization: {'AI-Generated' if ('pred' in locals() and pred == 1) else 'Human-Written' if ('pred' in locals() and pred == 0) else 'Error State'}",
+            f"Computed Confidence Reading Boundary Level: {confidence*100:.2f}%" if ('confidence' in locals() and pred is not None) else "N/A",
             "",
             "Complete Matrix Performance Mapping Log Data:",
         ]
