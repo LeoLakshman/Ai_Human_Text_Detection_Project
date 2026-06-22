@@ -1,0 +1,17 @@
+{
+  "TF-IDF": {
+    "accuracy": 0.9786063569682152,
+    "f1": 0.9786455155582673,
+    "train_time_sec": 0.1
+  },
+  "Linguistic": {
+    "accuracy": 0.8251833740831296,
+    "f1": 0.8331388564760793,
+    "train_time_sec": 0.02
+  },
+  "TF-IDF+Linguistic": {
+    "accuracy": 0.9786063569682152,
+    "f1": 0.9785670545009185,
+    "train_time_sec": 0.22
+  }
+}
