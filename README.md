@@ -89,10 +89,3 @@ into `data/training_data/train.csv` and `data/test_data/test.csv`.
 - "SVM" here is implemented as a calibrated `LinearSVC` (linear kernel),
   which is standard practice for high-dimensional sparse TF-IDF features and
   is dramatically faster than a kernel SVM at this feature size.
-
-## Demo video
-
-Anthropic's Claude can't record your screen for you — that part (Part of the
-rubric's 10 pts) needs to be you, actually clicking through the running app
-on your machine. Doing the Section 3/4 deep-learning run yourself first means
-you'll also be able to speak to it in the video.
