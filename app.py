@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 from scipy.sparse import hstack, csr_matrix
 
 from utils.text_features import (extract_linguistic_features, LINGUISTIC_FEATURE_NAMES,
-                                  simple_clean_text)
+                                 simple_clean_text)
 
 st.set_page_config(page_title="AI vs Human Text Detector", page_icon="🕵️", layout="wide")
 
@@ -56,20 +56,21 @@ def load_sklearn_models():
 
 @st.cache_resource
 def load_keras_models():
-    """Load Keras .h5 models (FNN/LSTM/CNN) if TensorFlow + the files are available.
-    These are produced by running scripts/03_deep_learning_RUN_LOCALLY.py locally."""
+    """Load your high-confidence Keras .h5 models (FNN/LSTM/CNN) directly from disk."""
     loaded = {}
     try:
         from tensorflow.keras.models import load_model
     except ImportError:
         return loaded  # TensorFlow not installed in this environment
+        
     for name, fname in [("FNN (Keras)", "fnn_model.h5"),
-                         ("LSTM", "lstm_model.h5"),
-                         ("CNN", "cnn_model.h5")]:
+                        ("LSTM", "lstm_model.h5"),
+                        ("CNN", "cnn_model.h5")]:
         path = os.path.join(MODELS_DIR, fname)
         if os.path.exists(path):
             try:
-                loaded[name] = load_model(path)
+                # compile=False avoids errors due to custom learning rates during inference loading
+                loaded[name] = load_model(path, compile=False)
             except Exception as e:
                 st.sidebar.warning(f"Could not load {name}: {e}")
     return loaded
@@ -77,24 +78,24 @@ def load_keras_models():
 
 @st.cache_resource
 def load_embedding_assets():
-    """Load Word2Vec model + Keras tokenizer for the deep-learning models, if present."""
-    w2v, tokenizer = None, None
-    w2v_path = os.path.join(MODELS_DIR, "embedding_model", "word2vec.model")
-    tok_path = os.path.join(MODELS_DIR, "embedding_model", "tokenizer.json")
-    if os.path.exists(w2v_path):
-        try:
-            from gensim.models import Word2Vec
-            w2v = Word2Vec.load(w2v_path)
-        except ImportError:
-            pass
-    if os.path.exists(tok_path):
-        try:
-            from tensorflow.keras.preprocessing.text import tokenizer_from_json
-            with open(tok_path) as f:
-                tokenizer = tokenizer_from_json(f.read())
-        except ImportError:
-            pass
-    return w2v, tokenizer
+    """Load the Keras text tokenizer sequence asset for deep-learning models."""
+    tokenizer = None
+    # Check for tokenizer json inside the embedding directory or directly in models/
+    tok_candidates = [
+        os.path.join(MODELS_DIR, "embedding_model", "tokenizer.json"),
+        os.path.join(MODELS_DIR, "tokenizer.json")
+    ]
+    
+    for path in tok_candidates:
+        if os.path.exists(path):
+            try:
+                from tensorflow.keras.preprocessing.text import tokenizer_from_json
+                with open(path, 'r', encoding='utf-8') as f:
+                    tokenizer = tokenizer_from_json(f.read())
+                break
+            except ImportError:
+                pass
+    return tokenizer
 
 
 # ---------------------------------------------------------------------------
@@ -133,15 +134,11 @@ def build_classical_features(text, tfidf, ling_scaler):
     return hstack([X_tfidf, csr_matrix(ling_s)]).tocsr(), ling[0]
 
 
-def doc_vector(tokens, w2v_model, dim=100):
-    vecs = [w2v_model.wv[t] for t in tokens if t in w2v_model.wv]
-    return np.mean(vecs, axis=0) if vecs else np.zeros(dim)
-
-
-def predict_with_model(name, text, models, tfidf, ling_scaler, w2v, tokenizer):
+def predict_with_model(name, text, models, tfidf, ling_scaler, tokenizer):
     """Returns (label_str, confidence_float_0to1)."""
     clean = simple_clean_text(text)
 
+    # Traditional ML Model routing logic
     if name in models["sklearn"]:
         model = models["sklearn"][name]
         X, _ = build_classical_features(text, tfidf, ling_scaler)
@@ -152,42 +149,51 @@ def predict_with_model(name, text, models, tfidf, ling_scaler, w2v, tokenizer):
         pred = int(proba >= 0.5)
         return pred, proba
 
+    # Keras Neural Networks parsing routing matrix logic
     if name in models["keras"]:
         model = models["keras"][name]
-        from utils.text_features import simple_tokenize
-        if name == "FNN (Keras)":
-            if w2v is None:
-                raise RuntimeError("Word2Vec embeddings not found — train locally first.")
-            vec = doc_vector(simple_tokenize(clean), w2v).reshape(1, -1)
-            proba = float(model.predict(vec, verbose=0).ravel()[0])
-        else:  # LSTM / CNN — need the tokenizer's padded sequence
-            if tokenizer is None:
-                raise RuntimeError("Tokenizer not found — train locally first.")
-            from tensorflow.keras.preprocessing.sequence import pad_sequences
-            seq = tokenizer.texts_to_sequences([clean])
-            padded = pad_sequences(seq, maxlen=250, padding="post", truncating="post")
-            proba = float(model.predict(padded, verbose=0).ravel()[0])
+        
+        if tokenizer is None:
+            raise RuntimeError("Sequence tokenizer asset not found in models/ folder.")
+            
+        from tensorflow.keras.preprocessing.sequence import pad_sequences
+        
+        # Convert raw text string into token-index integer sequences
+        seq = tokenizer.texts_to_sequences([clean])
+        padded = pad_sequences(seq, maxlen=250, padding="post", truncating="post")
+        
+        # Run inference matrix calculation
+        proba = float(model.predict(padded, verbose=0).ravel()[0])
         pred = int(proba >= 0.5)
         return pred, proba
 
-    raise ValueError(f"Unknown model: {name}")
+    raise ValueError(f"Unknown model architecture descriptor parameter: {name}")
 
 
 def explain_prediction(text, sklearn_models, tfidf, top_n=12):
-    """Word-level explanation using the SVM's linear coefficients (most interpretable
-    model here) applied to this document's TF-IDF weights."""
+    """Word-level explanation using the SVM's linear coefficients applied to this document's TF-IDF weights."""
     if "SVM" not in sklearn_models or tfidf is None:
         return None
     svm = sklearn_models["SVM"]
     try:
-        # CalibratedClassifierCV wraps one fitted LinearSVC per CV fold; average their coefs
-        coefs = np.mean([cc.estimator.coef_[0] for cc in svm.calibrated_classifiers_], axis=0)
+        # Check if the SVM model object is wrapped inside CalibratedClassifierCV or is a raw LinearSVC
+        if hasattr(svm, "calibrated_classifiers_"):
+            coefs = np.mean([cc.estimator.coef_[0] for cc in svm.calibrated_classifiers_], axis=0)
+        else:
+            coefs = svm.coef_[0]
+            if hasattr(coefs, "toarray"):
+                coefs = coefs.toarray().ravel()
     except Exception:
         return None
+        
     clean = simple_clean_text(text)
     X = tfidf.transform([clean])
     feature_names = np.array(tfidf.get_feature_names_out())
     nz = X.nonzero()[1]
+    
+    if len(nz) == 0:
+        return None
+        
     contributions = X[0, nz].toarray().ravel() * coefs[nz]
     order = np.argsort(-np.abs(contributions))[:top_n]
     return pd.DataFrame({
@@ -198,141 +204,140 @@ def explain_prediction(text, sklearn_models, tfidf, top_n=12):
 
 
 # ---------------------------------------------------------------------------
-# UI
+# UI Pipeline execution sequence code layout
 # ---------------------------------------------------------------------------
 st.title("🕵️ AI vs Human Text Detector")
-st.caption("Upload a document or paste text, choose a model, and get a prediction with confidence and explanation.")
+st.caption("Upload a document or paste text, choose an optimized model structure, and receive statistical classification breakdowns.")
 
 tfidf = load_tfidf()
 ling_scaler = load_ling_scaler()
 sklearn_models = load_sklearn_models()
 keras_models = load_keras_models()
-w2v, tokenizer = load_embedding_assets()
+tokenizer = load_embedding_assets()
+
 all_models = {"sklearn": sklearn_models, "keras": keras_models}
 available_model_names = list(sklearn_models.keys()) + list(keras_models.keys())
 
 if not available_model_names:
-    st.error("No trained models found in `models/`. Run the notebook (`notebooks/project1_notebook.ipynb`) "
-              "first to train and save the models.")
+    st.error("No trained models found in `models/`. Make sure your notebook outputs are pushed to your deployment directory.")
     st.stop()
 
 with st.sidebar:
-    st.header("Input")
+    st.header("Input Space")
     input_mode = st.radio("Provide text via:", ["Paste text", "Upload file (PDF/DOCX)"])
     text_input = ""
     if input_mode == "Paste text":
         text_input = st.text_area("Paste the text to analyze:", height=250,
-                                    placeholder="Paste an essay, article, or any passage here...")
+                                  placeholder="Paste an essay, article, or any passage here...")
     else:
         uploaded = st.file_uploader("Upload a PDF or Word document", type=["pdf", "docx"])
         if uploaded is not None:
-            with st.spinner("Extracting text..."):
+            with st.spinner("Extracting text layers..."):
                 text_input = extract_text(uploaded)
             st.success(f"Extracted {len(text_input.split())} words.")
             with st.expander("Preview extracted text"):
                 st.write(text_input[:2000] + ("..." if len(text_input) > 2000 else ""))
 
-    st.header("Model")
+    st.header("Model Parameters")
     model_choice = st.selectbox("Choose a classifier:", available_model_names)
     missing_dl = [n for n in ["FNN (Keras)", "LSTM", "CNN"] if n not in keras_models]
     if missing_dl:
-        st.caption(f"Not loaded (train locally to enable): {', '.join(missing_dl)}")
+        st.caption(f"Deep learning models currently inactive: {', '.join(missing_dl)}")
 
-    run_btn = st.button("🔍 Analyze", type="primary", use_container_width=True)
+    run_btn = st.button("🔍 Run Prediction Framework", type="primary", use_container_width=True)
 
-tab_predict, tab_compare, tab_report = st.tabs(["Prediction", "Model Comparison", "Downloadable Report"])
+tab_predict, tab_compare, tab_report = st.tabs(["Prediction Dashboard", "Model Comparison Matrix", "Downloadable Report"])
 
 if run_btn and text_input.strip():
     word_count = len(text_input.split())
     if word_count < 20:
-        st.warning("This text is quite short — predictions are more reliable on 50+ words.")
+        st.warning("This sequence string length is short — accuracy readings stabilize on sequences above 50+ words.")
 
     # ---- Single-model prediction ----
     with tab_predict:
         try:
-            pred, proba = predict_with_model(model_choice, text_input, all_models, tfidf, ling_scaler, w2v, tokenizer)
+            pred, proba = predict_with_model(model_choice, text_input, all_models, tfidf, ling_scaler, tokenizer)
         except Exception as e:
-            st.error(f"Prediction failed: {e}")
+            st.error(f"Prediction logic execution fault encountered: {e}")
             pred, proba = None, None
 
         if pred is not None:
-            label = "🤖 AI-Generated" if pred == 1 else "🧑 Human-Written"
+            label = "🤖 AI-Generated Text Detected" if pred == 1 else "🧑 Authentic Human-Written Text"
             confidence = proba if pred == 1 else 1 - proba
             c1, c2 = st.columns([1, 1])
             with c1:
-                st.metric("Prediction", label)
-                st.metric("Confidence", f"{confidence*100:.1f}%")
+                st.metric("Classifier Result Matrix", label)
+                st.metric("Model Confidence Evaluation", f"{confidence*100:.2f}%")
                 st.progress(float(confidence))
             with c2:
                 ling_feats = extract_linguistic_features(simple_clean_text(text_input))
-                st.write("**Quick stylistic signals**")
-                st.write(f"- Words: {word_count}")
-                st.write(f"- Avg sentence length: {ling_feats['avg_sentence_length']:.1f} words")
-                st.write(f"- Vocabulary richness (TTR): {ling_feats['type_token_ratio']:.3f}")
-                st.write(f"- Flesch Reading Ease: {ling_feats['flesch_reading_ease']:.1f}")
-                st.write(f"- Contraction use: {ling_feats['contraction_ratio']:.4f}")
+                st.write("**Extracted Document Linguistic Signal Values**")
+                st.write(f"- Absolute Token Word Count: {word_count}")
+                st.write(f"- Mean Sentence Evaluation Span: {ling_feats['avg_sentence_length']:.2f} words")
+                st.write(f"- Vocabulary Structural Richness (TTR Ratio): {ling_feats['type_token_ratio']:.3f}")
+                st.write(f"- Document Flesch Reading Score Profile: {ling_feats['flesch_reading_ease']:.1f}")
+                st.write(f"- Syntactic Phrase Contraction Density: {ling_feats['contraction_ratio']:.4f}")
 
-            st.subheader("Why this prediction? (word-level explanation)")
+            st.subheader("Why this prediction? (Word-Level Attribute Contribution Analysis)")
             exp_df = explain_prediction(text_input, sklearn_models, tfidf)
             if exp_df is not None and len(exp_df):
                 fig, ax = plt.subplots(figsize=(7, 4))
                 colors = exp_df["contribution"].apply(lambda v: "#DD8452" if v > 0 else "#4C72B0")
                 ax.barh(exp_df["term"][::-1], exp_df["contribution"][::-1], color=colors[::-1])
-                ax.set_xlabel("Contribution (← Human  |  AI →)")
+                ax.set_xlabel("Contribution Factor Index (← Human Style | AI Signature →)")
                 st.pyplot(fig)
-                st.caption("Explanation derived from the SVM's linear weights × this document's TF-IDF values "
-                            "(shown for any selected model, since SVM is the most directly interpretable).")
+                st.caption("Explanation derived from the SVM's linear weights vector mapping across the document's local TF-IDF matrices.")
             else:
-                st.info("Word-level explanation requires the SVM model to be available.")
+                st.info("Word-level explanation visualizations require the SVM classifier base weights vector to be active.")
 
     # ---- Side-by-side model comparison ----
     with tab_compare:
-        st.subheader("All available models on this same text")
+        st.subheader("Comparative Grid Model Evaluation Metrics Matrix")
         rows = []
         for name in available_model_names:
             try:
-                p, pr = predict_with_model(name, text_input, all_models, tfidf, ling_scaler, w2v, tokenizer)
+                p, pr = predict_with_model(name, text_input, all_models, tfidf, ling_scaler, tokenizer)
                 conf = pr if p == 1 else 1 - pr
-                rows.append({"Model": name, "Prediction": "AI" if p == 1 else "Human",
-                              "Confidence": f"{conf*100:.1f}%", "P(AI)": round(float(pr), 4)})
+                rows.append({"Model Name": name, "Prediction Class": "AI Generated" if p == 1 else "Human Document",
+                             "Confidence Index": f"{conf*100:.1f}%", "P(AI Probability Value)": round(float(pr), 4)})
             except Exception as e:
-                rows.append({"Model": name, "Prediction": "error", "Confidence": "-", "P(AI)": str(e)})
+                rows.append({"Model Name": name, "Prediction Class": "Execution Exception Fault", "Confidence Index": "-", "P(AI Probability Value)": str(e)})
         comp_df = pd.DataFrame(rows)
         st.dataframe(comp_df, use_container_width=True)
 
         fig, ax = plt.subplots(figsize=(7, 3.5))
-        plot_df = comp_df[comp_df["P(AI)"].apply(lambda x: isinstance(x, float))]
+        plot_df = comp_df[comp_df["P(AI Probability Value)"].apply(lambda x: isinstance(x, float))]
         if len(plot_df):
-            ax.bar(plot_df["Model"], plot_df["P(AI)"], color="#DD8452")
-            ax.axhline(0.5, color="gray", linestyle="--")
-            ax.set_ylabel("P(AI-generated)")
+            ax.bar(plot_df["Model Name"], plot_df["P(AI Probability Value)"], color="#DD8452")
+            ax.axhline(0.5, color="black", linestyle="--")
+            ax.set_ylabel("P(AI Probability Output Space)")
             ax.set_ylim(0, 1)
             plt.xticks(rotation=15)
             st.pyplot(fig)
 
     # ---- Downloadable report ----
     with tab_report:
-        st.subheader("Generate a downloadable analysis report")
+        st.subheader("Export Project Verification Metric Logs")
         report_lines = [
-            "AI vs HUMAN TEXT DETECTION REPORT",
-            f"Generated: {datetime.datetime.now().isoformat(timespec='seconds')}",
-            f"Word count: {word_count}",
+            "GRADUATE RESEARCH PROJECT DELIVERABLE LOG REPORT",
+            f"Execution Verification Timestamp (UTC): {datetime.datetime.now().isoformat(timespec='seconds')}",
+            f"Input Analysis Evaluation Token Metric Count: {word_count}",
             "",
-            f"Selected model: {model_choice}",
-            f"Prediction: {'AI-Generated' if pred == 1 else 'Human-Written' if pred == 0 else 'N/A'}",
-            f"Confidence: {confidence*100:.1f}%" if pred is not None else "",
+            f"Active Evaluation Model Selection ID: {model_choice}",
+            f"Calculated Inference Class Categorization: {'AI-Generated' if pred == 1 else 'Human-Written' if pred == 0 else 'Error State'}",
+            f"Computed Confidence Reading Boundary Level: {confidence*100:.2f}%" if pred is not None else "",
             "",
-            "All-model comparison:",
+            "Complete Matrix Performance Mapping Log Data:",
         ]
         for r in rows:
-            report_lines.append(f"  - {r['Model']}: {r['Prediction']} ({r['Confidence']})")
-        report_lines += ["", "Stylistic signals:"]
+            report_lines.append(f"  - {r['Model Name']}: {r['Prediction Class']} ({r['Confidence Index']})")
+        report_lines += ["", "Extracted Stylistic Features Signature Value Metrics:"]
         for k, v in ling_feats.items():
-            report_lines.append(f"  - {k}: {v:.4f}")
+            report_lines.append(f"  - Layer Attribute ID {k}: {v:.4f}")
         report_text = "\n".join(report_lines)
-        st.text_area("Report preview", report_text, height=300)
-        st.download_button("⬇️ Download report (.txt)", report_text,
+        st.text_area("Report text buffer snapshot preview data", report_text, height=300)
+        st.download_button("⬇️ Download analysis report (.txt)", report_text,
                              file_name="ai_human_detection_report.txt")
 else:
     with tab_predict:
-        st.info("Paste text or upload a file, choose a model in the sidebar, then click **Analyze**.")
+        st.info("Input a document context string or attach a text file asset, then select 'Run Prediction Framework' to evaluate.")
